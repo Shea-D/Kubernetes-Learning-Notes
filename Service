@@ -1,0 +1,96 @@
+在Kubernetes中，Service是分布式集群架构的核心。一个Service 对象拥有如下关键特征。
+	1. Service的服务进程通常基于Socket通信方式对外提供服务，比如 Redis、Memcached、MySQL、Web Server，或者是实现了某个具体业务的特定TCP Server进程。
+	2. 一个Service通常由多个相关的服务进程提供服务，每个服务进程都有一个独立的Endpoint（IP+Port）访问点，Kubernetes能够让我们通过Service（ClusterIP+Service Port）连接指定的服务。有了Kubernetes内建的透明负载均衡和故障恢复机 制，不管后端有多少个具体的服务进程，也不管某个服务进程是否由 于发生故障而被重新部署到其他机器，都不会影响对服务的正常调 用。更重要的是，这个Service本身一旦创建就不再变化，IP不变。
+					
+当创建Service的时候会通过api-server向etcd写入创建的service的信息，而kube-proxy会基于监听的机制发现这种Service的变动，然后它会将最新的Service信息转换成对应的访问规则，这个规则会在集群内的所有节点上都生成，所以可以在任意一个节点上访问。如上图，设置了LS之后，Service端访问的信息会经过Kube-proxy设置的规则进行转化，轮询（或者其他形式）对应的ip。
+rr：轮询
+
+	- SERVICE创建
+		a. 暴露service：kubectl expose deploy nginx --name=svc-nginx1 --type=ClusterIp --port=8080 --target-port=8080 -n testns #控制器名称为nginx，创建的svc名称为svc-nginx1，类型为ClusterIp（集群内部可访问，需要改成外部可访问，把type改成nodeport则可以在集群外访问，访问地址为集群ip+创建成功后对应的集群的转发端口号），指定了Service本身的端口号为8080，targetPort则用来指定后端Pod的容器端口号。
+		b. 用yaml文件创建。
+	- SERVICE删除
+		○ 删除可以直接delete -f <yaml文件>或者指定svc名称
+	
+低阶目标：
+1.了解K8s的Service是什么，有哪些特点。
+2.了解Service中yaml文件的选项设置作用。
+3.了解为什么前后端pod要进行解耦，Service和Label Selector对应的工作流程。
+4.了解K8S中集群外的流量是怎么访问pod的，以及Service对应的四种类型的原理和工作流程（ClusterIP，NodePort，LoadBalancer，ExternalName）。
+5.了解Service是通过什么怎么提供远程服务的，以及对应的三种代理模式原理和使用方法（kube-proxy  userspace模式，iptables模式，ipvs模式）。
+6.了解Service是怎么实现的负载均衡，对应的两种负载均衡器的原理（kube-proxy）。
+7.了解服务发现是什么，在K8S中服务发现是以何种方式体现的。
+
+高阶目标：
+1.使用 Service 把前端连接到后端。
+2.Service对集群外提供服务有什么更好的方式，简述工作原理，工作机制，能够自己进行实践（Ingress）
+3.如果不使用Service的负载均衡，如何自己控制负载均衡，具体的应用场景，能够自己进行实践（HeadLiness Service）
+
+
+	- 三种工作模式
+		○ userspace模式：userspace模式下，kube-proxy会为每一个Service创建一个监听端口，发向Cluster IP的请求被Iptables规则重定向到kube-proxy监听的端口上，kube-proxy根据LB算法选择一个提供服务的Pod并和其建立链接，以将请求转发到Pod上。 该模式下，kube-proxy充当了一个四层负责均衡器的角色。由于kube-proxy运行在userspace中，在进行转发处理时会增加内核和用户空间之间的数据拷贝，虽然比较稳定，但是效率比较低。
+					
+		
+		○ iptables模式：iptables模式下，kube-proxy为service后端的每个Pod创建对应的iptables规则，直接将发向Cluster IP的请求重定向到一个Pod IP。 该模式下kube-proxy不承担四层负责均衡器的角色，只负责创建iptables规则。该模式的优点是较userspace模式效率更高，但不能提供灵活的LB策略，当后端Pod不可用时也无法进行重试。
+					
+		○ ipvs模式：ipvs模式和iptables类似，kube-proxy监控Pod的变化并创建相应的ipvs规则。ipvs相对iptables转发效率更高。除此以外，ipvs支持更多的LB算法。
+					
+			ps：此模式必须安装ipvs内核模块，否则会降级为iptables。
+			
+			
+	- 四种类型：
+	
+	
+		
+		○ ClusterIP：默认值，它是Kubernetes系统自动分配的虚拟IP，只能在集群内部访问
+		○ NodePort：将Service通过指定的Node上的端口暴露给外部，通过此方法，就可以在集群外部访问服务
+		在之前的样例中，创建的Service的ip地址只有集群内部才可以访问，如果希望将Service暴露给集群外部使用，那么就要使用到另外一种类型的Service，称为NodePort类型。NodePort的工作原理其实就是将service的端口映射到Node的一个端口上，然后就可以通过NodeIp:NodePort来访问service了。
+			
+		○ LoadBalancer：使用外接负载均衡器完成到服务的负载分发，注意此模式需要外部云环境支持
+		LoadBalancer和NodePort很相似，目的都是向外部暴露一个端口，区别在于LoadBalancer会在集群的外部再来做一个负载均衡设备，而这个设备需要外部环境支持的，外部服务发送到这个设备上的请求，会被设备负载之后转发到集群中。
+		
+		○ ExternalName： 把集群外部的服务引入集群内部，直接使用
+		ExternalName类型的Service用于引入集群外部的服务，它通过externalName属性指定外部一个服务的地址，然后在集群内部访问此service就可以访问到外部的服务了。
+		
+		
+		
+		修改这个部分
+		在节点内进行域名解析：dig @10.96.0.10 service-externalname.dev.svc.cluster.local # <pod名称>.<名称空间>.svc.cluster.local
+		
+	特殊类型：Headliness类型，在需要自己来控制负载均衡策略时所用的防暑，这Service不会分配CluesterIP，即设置文件时：
+	
+	创建之后能发现未分配CluesterIP，但是和pod的关联还在。我们想要访问service时，只能通过service的域名进行查询。
+
+	Endpoint：
+	Endpoint是kubernetes中的一个资源对象，存储在etcd中，用来记录一个service对应的所有pod的访问地址，它是根据service配置文件中selector描述产生的。
+	一个Service由一组Pod组成，这些Pod通过Endpoints暴露出来，Endpoints是实现实际服务的端点集合。换句话说，service和pod之间的联系是通过endpoints实现的。
+	负载分发策略：
+	对Service的访问被分发到了后端的Pod上去，目前kubernetes提供了两种负载分发策略：
+		○ 如果不定义，默认使用kube-proxy的策略，比如随机、轮询
+		○ 基于客户端地址的会话保持模式，即来自同一个客户端发起的所有请求都会转发到固定的一个Pod上（此模式可以使在spec中添加sessionAffinity:ClientIP选项）
+	
+	Ingress：
+	在前面课程中已经提到，Service对集群之外暴露服务的主要方式有两种：NotePort和LoadBalancer，但是这两种方式，都有一定的缺点：
+	
+	NodePort方式的缺点是会占用很多集群机器的端口，那么当集群服务变多的时候，这个缺点就愈发明显
+	LB方式的缺点是每个service需要一个LB，浪费、麻烦，并且需要kubernetes之外设备的支持
+	基于这种现状，kubernetes提供了Ingress资源对象，Ingress只需要一个NodePort或者一个LB就可以满足暴露多个Service的需求。工作机制大致如下图表示：
+					
+	实际上，Ingress相当于一个7层的负载均衡器，是kubernetes对反向代理的一个抽象，它的工作原理类似于Nginx，可以理解成在Ingress里建立诸多映射规则，Ingress Controller通过监听这些配置规则并转化成Nginx的反向代理配置 , 然后对外部提供服务。在这里有两个核心概念：
+	
+	ingress：kubernetes中的一个对象，作用是定义请求如何转发到service的规则
+	ingress controller：具体实现反向代理及负载均衡的程序，对ingress定义的规则进行解析，根据配置的规则来实现请求转发，实现方式有很多，比如Nginx, Contour, Haproxy等等
+	Ingress（以Nginx为例）的工作原理如下：
+	
+	用户编写Ingress规则，说明哪个域名对应kubernetes集群中的哪个Service
+	Ingress控制器动态感知Ingress服务规则的变化，然后生成一段对应的Nginx反向代理配置
+	Ingress控制器会将生成的Nginx配置写入到一个运行着的Nginx服务中，并动态更新
+	到此为止，其实真正在工作的就是一个Nginx了，内部配置了用户定义的请求转发规则
+					
+	
+	服务发现机制：
+		服务发现机制指客户端应用在一个集群中如何获知后端服务的访问方式。以固定的方式获取后端服务的访问地址：环境变量方式和DNS方式。
+			§ 环境变量方式：在一个Pod运行起来的时候，系统会自动为其容器运行环境注入所有集群中有效Service的信息。Service的相关信息包括服务IP、服务端口号 、各端口号相关的协议 等，通过{SVCNAME}_SERVICE_HOST和{SVCNAME}_SERVICE_PORT格式进行设置。
+			§ DNS方式：Service在Kubernetes系统中遵循DNS命名规范，Service的DNS域名表示方法为..svc.，其中 servicename为服务的名称，namespace为其所在namespace的名称， clusterdomain为Kubernetes集群设置的域名后缀（例如cluster.local）， 服务名称的命名规则遵循RFC 1123规范的要求。
+	
+	
+	
